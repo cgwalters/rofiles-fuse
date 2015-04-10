@@ -29,11 +29,12 @@ rather than in-place edits.
 
 Now we have a "rofiles" mount at `/srv/backups/mnt`.  If we try this:
 
-    $ vi /srv/backups/mnt/document
+    $ echo new doc content > /srv/backups/mnt/document
+    bash: /srv/backups/mnt/document: Read-only file system
 
-It will fail as vi (or at least most implementions) do edit-in-place.
-If instead we create `document.tmp` and then rename it, it will break
-the hard link:
+It failed because the `>` redirection operator will try to truncate
+the existing file.  If instead we create `document.tmp` and then
+rename it atomically over the old one, it will work:
 
     $ echo new doc content > /srv/backups/mnt/document.tmp
     $ mv /srv/backups/mnt/document.tmp /srv/backups/mnt/document

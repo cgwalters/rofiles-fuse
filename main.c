@@ -42,6 +42,12 @@
 #include <unistd.h>
 #include <fuse.h>
 
+#include <glib.h>
+
+// Global to store our read-write path
+static int basefd = -1;
+static GHashTable *created_devino_hash = NULL;
+
 static inline void
 glnx_cleanup_close_fdp (int *fdp)
 {
@@ -65,8 +71,50 @@ ENSURE_RELPATH (const char *path)
   return path + strspn (path, "/");
 }
 
-// Global to store our read-write path
-static int basefd = -1;
+typedef struct {
+  dev_t dev;
+  ino_t ino;
+} DevIno;
+
+static guint
+devino_hash (gconstpointer a)
+{
+  DevIno *a_i = (gpointer)a;
+  return (guint) (a_i->dev + a_i->ino);
+}
+
+static int
+devino_equal (gconstpointer   a,
+              gconstpointer   b)
+{
+  DevIno *a_i = (gpointer)a;
+  DevIno *b_i = (gpointer)b;
+  return a_i->dev == b_i->dev
+    && a_i->ino == b_i->ino;
+}
+
+static gboolean
+devino_set_contains (dev_t dev, ino_t ino)
+{
+  DevIno devino = { dev, ino };
+  return g_hash_table_contains (created_devino_hash, &devino);
+}
+
+static gboolean
+devino_set_insert (dev_t dev, ino_t ino)
+{
+  DevIno *devino = g_new (DevIno, 1);
+  devino->dev = dev;
+  devino->ino = ino;
+  return g_hash_table_add (created_devino_hash, devino);
+}
+
+static gboolean
+devino_set_remove (dev_t dev, ino_t ino)
+{
+  DevIno devino = { dev, ino };
+  return g_hash_table_remove (created_devino_hash, &devino);
+}
 
 static int
 callback_getattr (const char *path, struct stat *st_data)
@@ -79,7 +127,7 @@ callback_getattr (const char *path, struct stat *st_data)
     }
   else
     {
-      if (fstatat (basefd, path, st_data, 0) == -1)
+      if (fstatat (basefd, path, st_data, AT_SYMLINK_NOFOLLOW) == -1)
 	return -errno;
     }
   return 0;
@@ -161,7 +209,15 @@ callback_mkdir (const char *path, mode_t mode)
 static int
 callback_unlink (const char *path)
 {
+  struct stat stbuf;
   path = ENSURE_RELPATH (path);
+
+  if (fstatat (basefd, path, &stbuf, AT_SYMLINK_NOFOLLOW) == 0)
+    {
+      if (!S_ISDIR (stbuf.st_mode))
+	devino_set_remove (stbuf.st_dev, stbuf.st_ino);
+    }
+
   if (unlinkat (basefd, path, 0) == -1)
     return -errno;
   return 0;
@@ -179,9 +235,19 @@ callback_rmdir (const char *path)
 static int
 callback_symlink (const char *from, const char *to)
 {
+  struct stat stbuf;
+
   to = ENSURE_RELPATH (to);
+
   if (symlinkat (from, basefd, to) == -1)
     return -errno;
+
+  if (fstatat (basefd, to, &stbuf, AT_SYMLINK_NOFOLLOW) == -1)
+    {
+      fprintf (stderr, "Failed to find newly created symlink '%s': %s\n",
+	       to, g_strerror (errno));
+      exit (1);
+    }
   return 0;
 }
 
@@ -210,10 +276,14 @@ static int
 can_write (const char *path)
 {
   struct stat stbuf;
-  path = ENSURE_RELPATH (path);
   if (fstatat (basefd, path, &stbuf, 0) == -1)
-    return -errno;
-  if (!S_ISDIR (stbuf.st_mode))
+    {
+      if (errno == ENOENT)
+	return 0;
+      else
+	return -errno;
+    }
+  if (devino_set_contains (stbuf.st_dev, stbuf.st_ino))
     return -EROFS;
   return 0;
 }
@@ -247,22 +317,93 @@ callback_chown (const char *path, uid_t uid, gid_t gid)
 static int
 callback_truncate (const char *path, off_t size)
 {
-  return -EROFS;
+  glnx_fd_close int fd = -1;
+
+  path = ENSURE_RELPATH (path);
+  VERIFY_WRITE(path);
+
+  fd = openat (basefd, path, O_RDWR | O_CREAT);
+  if (fd == -1)
+    return -errno;
+
+  if (ftruncate (fd, size) == -1)
+    return -errno;
+
+  return 0;
 }
 
 static int
 callback_utime (const char *path, struct utimbuf *buf)
 {
-  return -EROFS;
+  struct timespec ts[2];
+
+  path = ENSURE_RELPATH (path);
+
+  ts[0].tv_sec = buf->actime;
+  ts[0].tv_nsec = UTIME_OMIT;
+  ts[1].tv_sec = buf->modtime;
+  ts[1].tv_nsec = UTIME_OMIT;
+
+  if (utimensat (basefd, path, ts, AT_SYMLINK_NOFOLLOW) == -1)
+    return -errno;
+
+  return 0;
+}
+
+static int
+do_open (const char *path, mode_t mode, struct fuse_file_info *finfo)
+{
+  const int flags = finfo->flags & O_ACCMODE;
+  int fd;
+  struct stat stbuf;
+
+  path = ENSURE_RELPATH (path);
+
+  /* Support read only opens */
+  G_STATIC_ASSERT (O_RDONLY == 0);
+
+  if (flags == 0)
+    fd = openat (basefd, path, flags);
+  else
+    {
+      const int forced_excl_flags = flags | O_CREAT | O_EXCL;
+      /* Do an exclusive open, don't allow writable fds for existing
+	 files */
+      fd = openat (basefd, path, forced_excl_flags, mode);
+      /* If they didn't specify O_EXCL, give them EROFS if the file
+       * exists.
+       */
+      if (fd == -1 && (flags & O_EXCL) == 0)
+	{
+	  if (errno == EEXIST)
+	    errno = EROFS;
+	}
+      else if (fd != -1)
+	{
+	  if (fstat (fd, &stbuf) == -1)
+	    return -errno;
+	  devino_set_insert (stbuf.st_dev, stbuf.st_ino);
+	}
+    }
+
+  if (fd == -1)
+    return -errno;
+
+  finfo->fh = fd;
+
+  return 0;
 }
 
 static int
 callback_open (const char *path, struct fuse_file_info *finfo)
 {
-  const int flags = finfo->flags & O_ACCMODE;
-  if (!(flags & O_RDONLY))
-    return -EROFS;
-  return 0;
+  return do_open (path, 0, finfo);
+}
+
+static int
+callback_create(const char *path, mode_t mode, struct fuse_file_info *finfo)
+{
+  return do_open (path, mode, finfo);
 }
 
 static int
@@ -270,15 +411,7 @@ callback_read (const char *path, char *buf, size_t size, off_t offset,
 	       struct fuse_file_info *finfo)
 {
   int r;
-  glnx_fd_close int fd = -1;
-
-  path = ENSURE_RELPATH (path);
-
-  fd = openat (basefd, path, O_RDONLY);
-  if (fd == -1)
-    return -errno;
-
-  r = pread (fd, buf, size, offset);
+  r = pread (finfo->fh, buf, size, offset);
   if (r == -1)
     return -errno;
   return r;
@@ -288,7 +421,11 @@ static int
 callback_write (const char *path, const char *buf, size_t size, off_t offset,
 		struct fuse_file_info *finfo)
 {
-  return -EROFS;
+  int r;
+  r = pwrite (finfo->fh, buf, size, offset);
+  if (r == -1)
+    return -errno;
+  return r;
 }
 
 static int
@@ -302,23 +439,27 @@ callback_statfs (const char *path, struct statvfs *st_buf)
 static int
 callback_release (const char *path, struct fuse_file_info *finfo)
 {
+  (void) close (finfo->fh);
   return 0;
 }
 
 static int
 callback_fsync (const char *path, int crap, struct fuse_file_info *finfo)
 {
-  return -EROFS;
+  if (fsync (finfo->fh) == -1)
+    return -errno;
+  return 0;
 }
 
 static int
 callback_access (const char *path, int mode)
 {
-  if (mode & W_OK)
-    return -EROFS;
-
   path = ENSURE_RELPATH (path);
-
+  
+  /* Apparently at least GNU coreutils rm calls `faccessat(W_OK)`
+   * before trying to do an unlink.  So...we'll just lie about
+   * writable access here.
+   */
   if (faccessat (basefd, path, mode, 0) == -1)
     return -errno;
   return 0;
@@ -373,6 +514,7 @@ struct fuse_operations callback_oper = {
   .chown = callback_chown,
   .truncate = callback_truncate,
   .utime = callback_utime,
+  .create = callback_create,
   .open = callback_open,
   .read = callback_read,
   .write = callback_write,
@@ -470,6 +612,8 @@ main (int argc, char *argv[])
       fprintf (stderr, "see `%s -h' for usage\n", argv[0]);
       exit (1);
     }
+
+  created_devino_hash = g_hash_table_new_full (devino_hash, devino_equal, g_free, NULL); 
 
   fuse_main (args.argc, args.argv, &callback_oper, NULL);
 

@@ -256,7 +256,6 @@ callback_rename (const char *from, const char *to)
 {
   from = ENSURE_RELPATH (from);
   to = ENSURE_RELPATH (to);
-  if (symlinkat (from, basefd, to) == -1)
   if (renameat (basefd, from, basefd, to) == -1)
     return -errno;
   return 0;

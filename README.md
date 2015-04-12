@@ -11,8 +11,8 @@ This filesystem is designed for OSTree and other systems that create
 Normally with hard links, if you change one, you change them all.
 
 There are two approaches to dealing with that:
- - Copy on write (what BTRFS supports)
- - Make them read-only (what this FUSE mount does)
+ - Copy on write: implemented by BTRFS, overlayfs, and http://linux-vserver.org/util-vserver:Vhashify
+ - Make them read-only: what this FUSE mount does
 
 Usage
 =====
